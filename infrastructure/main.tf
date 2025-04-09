@@ -192,6 +192,13 @@ resource "aws_lambda_function" "log_processor" {
     subnet_ids         = var.private_subnet_ids
     security_group_ids = [aws_security_group.lambda_sg.id]
   }
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.dlq.arn
+  }
+
+  code_signing_config_arn        = aws_lambda_code_signing_config.signing_config.arn
+  reserved_concurrent_executions = 50
 }
 
 # Add Lambda function for secret rotation
@@ -211,11 +218,19 @@ resource "aws_lambda_function" "rotation_lambda" {
     security_group_ids = [aws_security_group.lambda_sg.id]
   }
 
+  dead_letter_config {
+    target_arn = aws_sqs_queue.dlq.arn
+  }
+
   environment {
     variables = {
       SECRETS_MANAGER_ENDPOINT = "https://secretsmanager.${data.aws_region.current.name}.amazonaws.com"
     }
   }
+
+  kms_key_arn                    = aws_kms_key.encryption_key.arn
+  code_signing_config_arn        = aws_lambda_code_signing_config.signing_config.arn
+  reserved_concurrent_executions = 25
 }
 
 resource "aws_lambda_code_signing_config" "signing_config" {
@@ -333,6 +348,90 @@ resource "aws_s3_bucket_logging" "lb_logs" {
   target_prefix = "log/"
 }
 
+resource "aws_s3_bucket_server_side_encryption_configuration" "lb_logs" {
+  bucket = aws_s3_bucket.lb_logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      kms_master_key_id = aws_kms_key.encryption_key.arn
+      sse_algorithm     = "aws:kms"
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "lb_logs" {
+  bucket = aws_s3_bucket.lb_logs.id
+
+  rule {
+    id     = "default_abort_multipart"
+    status = "Enabled"
+
+    filter {
+      prefix = "" # Empty prefix applies to all objects
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  rule {
+    id     = "lb_logs_lifecycle"
+    status = "Enabled"
+
+    filter {
+      prefix = "lb-logs/"
+    }
+
+    transition {
+      days          = 30
+      storage_class = "STANDARD_IA"
+    }
+
+    transition {
+      days          = 90
+      storage_class = "GLACIER"
+    }
+
+    expiration {
+      days = 365
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "lb_logs" {
+  bucket = aws_s3_bucket.lb_logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_replication_configuration" "lb_logs" {
+  bucket = aws_s3_bucket.lb_logs.id
+  role   = aws_iam_role.replication.arn
+
+  rule {
+    id     = "lb_logs_replication"
+    status = "Enabled"
+
+    destination {
+      bucket        = aws_s3_bucket.lb_logs_replica.arn
+      storage_class = "STANDARD_IA"
+    }
+  }
+}
+
+resource "aws_s3_bucket_notification" "lb_logs" {
+  bucket = aws_s3_bucket.lb_logs.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.log_processor.arn
+    events              = ["s3:ObjectCreated:*"]
+  }
+}
+
 resource "aws_s3_bucket" "log_bucket" {
   bucket = "demo-lb-logs-logging-${data.aws_caller_identity.current.account_id}"
 }
@@ -359,6 +458,19 @@ resource "aws_s3_bucket_lifecycle_configuration" "log_bucket" {
   bucket = aws_s3_bucket.log_bucket.id
 
   rule {
+    id     = "default_abort_multipart"
+    status = "Enabled"
+
+    filter {
+      prefix = "" # Empty prefix applies to all objects
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  rule {
     id     = "log_bucket_lifecycle"
     status = "Enabled"
 
@@ -378,10 +490,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "log_bucket" {
 
     expiration {
       days = 365
-    }
-
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 7
     }
   }
 }
@@ -449,6 +557,19 @@ resource "aws_s3_bucket_lifecycle_configuration" "lb_logs_replica" {
   bucket   = aws_s3_bucket.lb_logs_replica.id
 
   rule {
+    id     = "default_abort_multipart"
+    status = "Enabled"
+
+    filter {
+      prefix = "" # Empty prefix applies to all objects
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  rule {
     id     = "replica_lifecycle"
     status = "Enabled"
 
@@ -468,10 +589,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "lb_logs_replica" {
 
     expiration {
       days = 365
-    }
-
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 7
     }
   }
 }
@@ -534,6 +651,19 @@ resource "aws_s3_bucket_lifecycle_configuration" "log_bucket_replica" {
   bucket   = aws_s3_bucket.log_bucket_replica.id
 
   rule {
+    id     = "default_abort_multipart"
+    status = "Enabled"
+
+    filter {
+      prefix = "" # Empty prefix applies to all objects
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  rule {
     id     = "replica_lifecycle"
     status = "Enabled"
 
@@ -553,10 +683,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "log_bucket_replica" {
 
     expiration {
       days = 365
-    }
-
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 7
     }
   }
 }
@@ -799,6 +925,86 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "waf_logs" {
     apply_server_side_encryption_by_default {
       kms_master_key_id = aws_kms_key.encryption_key.arn
       sse_algorithm     = "aws:kms"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "waf_logs" {
+  bucket = aws_s3_bucket.waf_logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "waf_logs" {
+  bucket = aws_s3_bucket.waf_logs.id
+
+  rule {
+    id     = "default_abort_multipart"
+    status = "Enabled"
+
+    filter {
+      prefix = "" # Empty prefix applies to all objects
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  rule {
+    id     = "waf_logs_lifecycle"
+    status = "Enabled"
+
+    filter {
+      prefix = "waf-logs/"
+    }
+
+    transition {
+      days          = 30
+      storage_class = "STANDARD_IA"
+    }
+
+    transition {
+      days          = 90
+      storage_class = "GLACIER"
+    }
+
+    expiration {
+      days = 365
+    }
+  }
+}
+
+resource "aws_s3_bucket_logging" "waf_logs" {
+  bucket = aws_s3_bucket.waf_logs.id
+
+  target_bucket = aws_s3_bucket.log_bucket.id
+  target_prefix = "waf-logs/"
+}
+
+resource "aws_s3_bucket_notification" "waf_logs" {
+  bucket = aws_s3_bucket.waf_logs.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.log_processor.arn
+    events              = ["s3:ObjectCreated:*"]
+  }
+}
+
+resource "aws_s3_bucket_replication_configuration" "waf_logs" {
+  bucket = aws_s3_bucket.waf_logs.id
+  role   = aws_iam_role.replication.arn
+
+  rule {
+    id     = "waf_logs_replication"
+    status = "Enabled"
+
+    destination {
+      bucket        = aws_s3_bucket.log_bucket_replica.arn
+      storage_class = "STANDARD_IA"
     }
   }
 }
