@@ -2,12 +2,37 @@ provider "aws" {
   region = "us-west-2"
 }
 
+provider "aws" {
+  alias  = "replica_region"
+  region = "us-east-1" # Using us-east-1 as the replica region
+}
+
+variable "vpc_id" {
+  description = "VPC ID where resources will be created"
+  type        = string
+}
+
+variable "private_subnet_ids" {
+  description = "List of private subnet IDs for Lambda function"
+  type        = list(string)
+}
+
+variable "public_subnet_ids" {
+  description = "List of public subnet IDs for ALB"
+  type        = list(string)
+}
+
+variable "certificate_arn" {
+  description = "ARN of ACM certificate for ALB HTTPS listener"
+  type        = string
+}
+
 # Create KMS key for encryption
 resource "aws_kms_key" "encryption_key" {
   description             = "KMS key for encrypting resources"
   deletion_window_in_days = 7
   enable_key_rotation     = true
-  
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -26,10 +51,10 @@ resource "aws_kms_key" "encryption_key" {
 
 resource "aws_ecr_repository" "lambda_repo" {
   name = "demo-lambda-repo"
-  
+
   encryption_configuration {
     encryption_type = "KMS"
-    kms_key        = aws_kms_key.encryption_key.arn
+    kms_key         = aws_kms_key.encryption_key.arn
   }
 
   image_scanning_configuration {
@@ -40,41 +65,37 @@ resource "aws_ecr_repository" "lambda_repo" {
 }
 
 resource "aws_db_instance" "aurora" {
-  identifier          = "demo-aurora"
-  engine              = "aurora-mysql"
-  instance_class      = "db.t3.medium"
-  username            = "admin"
-  password            = aws_secretsmanager_secret_version.db_password.secret_string
-  
+  identifier     = "demo-aurora"
+  engine         = "aurora-mysql"
+  instance_class = "db.t3.medium"
+  username       = "admin"
+  password       = aws_secretsmanager_secret_version.db_password.secret_string
+
   multi_az            = true
   deletion_protection = true
   storage_encrypted   = true
-  kms_key_id         = aws_kms_key.encryption_key.arn
-  
-  copy_tags_to_snapshot = true
-  skip_final_snapshot   = false
+  kms_key_id          = aws_kms_key.encryption_key.arn
+
+  copy_tags_to_snapshot     = true
+  skip_final_snapshot       = false
   final_snapshot_identifier = "demo-aurora-final-snapshot"
-  
+
   auto_minor_version_upgrade = true
-  
+
   enabled_cloudwatch_logs_exports = ["audit", "error", "general", "slowquery"]
-  
+
   monitoring_interval = 30
   monitoring_role_arn = aws_iam_role.rds_monitoring.arn
-  
-  performance_insights_enabled = true
+
+  performance_insights_enabled    = true
   performance_insights_kms_key_id = aws_kms_key.encryption_key.arn
-  
+
   backup_retention_period = 7
 }
 
 resource "aws_secretsmanager_secret" "db_password" {
-  name = "demo-aurora-password"
+  name       = "demo-aurora-password"
   kms_key_id = aws_kms_key.encryption_key.arn
-  
-  rotation_rules {
-    automatically_after_days = 30
-  }
 }
 
 resource "aws_secretsmanager_secret_version" "db_password" {
@@ -100,7 +121,7 @@ resource "aws_secretsmanager_secret_rotation" "db_password" {
 
 resource "aws_iam_role" "rds_monitoring" {
   name = "demo-rds-monitoring"
-  
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -121,46 +142,87 @@ resource "aws_iam_role_policy_attachment" "rds_monitoring" {
 }
 
 resource "aws_lambda_function" "hello_world" {
-  filename         = "../src/lambda_function.zip"
-  function_name    = "hello-world"
-  role            = aws_iam_role.lambda_role.arn
-  handler         = "lambda_function.handler"
-  runtime         = "python3.9"
-  
-  package_type    = "Image"
-  image_uri       = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
-  
+  filename      = "../src/lambda_function.zip"
+  function_name = "hello-world"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "lambda_function.handler"
+  runtime       = "python3.9"
+
+  package_type = "Image"
+  image_uri    = "${aws_ecr_repository.lambda_repo.repository_url}:latest"
+
   tracing_config {
     mode = "Active"
   }
-  
+
   vpc_config {
     subnet_ids         = var.private_subnet_ids
     security_group_ids = [aws_security_group.lambda_sg.id]
   }
-  
+
   dead_letter_config {
     target_arn = aws_sqs_queue.dlq.arn
   }
-  
+
   environment {
     variables = {
       POWERTOOLS_SERVICE_NAME = "hello-world"
-      LOG_LEVEL              = "INFO"
+      LOG_LEVEL               = "INFO"
     }
   }
-  
-  kms_key_arn = aws_kms_key.encryption_key.arn
+
+  kms_key_arn             = aws_kms_key.encryption_key.arn
   code_signing_config_arn = aws_lambda_code_signing_config.signing_config.arn
-  
+
   reserved_concurrent_executions = 100
+}
+
+resource "aws_lambda_function" "log_processor" {
+  filename      = "../src/log_processor.zip"
+  function_name = "log-processor"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "log_processor.handler"
+  runtime       = "python3.9"
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
+}
+
+# Add Lambda function for secret rotation
+resource "aws_lambda_function" "rotation_lambda" {
+  filename      = "../src/rotation_lambda.zip"
+  function_name = "secret-rotation"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "rotation_lambda.handler"
+  runtime       = "python3.9"
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
+
+  environment {
+    variables = {
+      SECRETS_MANAGER_ENDPOINT = "https://secretsmanager.${data.aws_region.current.name}.amazonaws.com"
+    }
+  }
 }
 
 resource "aws_lambda_code_signing_config" "signing_config" {
   allowed_publishers {
     signing_profile_version_arns = [aws_signer_signing_profile.lambda_profile.arn]
   }
-  
+
   policies {
     untrusted_artifact_on_deployment = "Enforce"
   }
@@ -171,7 +233,7 @@ resource "aws_signer_signing_profile" "lambda_profile" {
 }
 
 resource "aws_sqs_queue" "dlq" {
-  name = "hello-world-dlq"
+  name              = "hello-world-dlq"
   kms_master_key_id = aws_kms_key.encryption_key.id
 }
 
@@ -179,7 +241,7 @@ resource "aws_security_group" "lambda_sg" {
   name        = "lambda-sg"
   description = "Security group for Lambda function"
   vpc_id      = var.vpc_id
-  
+
   egress {
     description = "Allow HTTPS outbound"
     from_port   = 443
@@ -191,7 +253,7 @@ resource "aws_security_group" "lambda_sg" {
 
 resource "aws_iam_role" "lambda_role" {
   name = "hello-world-lambda"
-  
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -225,14 +287,14 @@ resource "aws_lb" "front_end" {
   name               = "demo-lb"
   internal           = false
   load_balancer_type = "application"
-  
+
   enable_deletion_protection = true
-  enable_http2             = true
+  enable_http2               = true
   drop_invalid_header_fields = true
-  
-  subnets = var.public_subnet_ids
+
+  subnets         = var.public_subnet_ids
   security_groups = [aws_security_group.alb_sg.id]
-  
+
   access_logs {
     bucket  = aws_s3_bucket.lb_logs.id
     enabled = true
@@ -243,7 +305,7 @@ resource "aws_security_group" "alb_sg" {
   name        = "alb-sg"
   description = "Security group for ALB"
   vpc_id      = var.vpc_id
-  
+
   ingress {
     description = "Allow HTTPS inbound"
     from_port   = 443
@@ -255,15 +317,18 @@ resource "aws_security_group" "alb_sg" {
 
 resource "aws_s3_bucket" "lb_logs" {
   bucket = "demo-lb-logs-${data.aws_caller_identity.current.account_id}"
-  
-  versioning {
-    enabled = true
+}
+
+resource "aws_s3_bucket_versioning" "lb_logs" {
+  bucket = aws_s3_bucket.lb_logs.id
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
 resource "aws_s3_bucket_logging" "lb_logs" {
   bucket = aws_s3_bucket.lb_logs.id
-  
+
   target_bucket = aws_s3_bucket.log_bucket.id
   target_prefix = "log/"
 }
@@ -272,86 +337,9 @@ resource "aws_s3_bucket" "log_bucket" {
   bucket = "demo-lb-logs-logging-${data.aws_caller_identity.current.account_id}"
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "lb_logs" {
-  bucket = aws_s3_bucket.lb_logs.id
-  
-  rule {
-    id     = "log_lifecycle"
-    status = "Enabled"
-    
-    transition {
-      days          = 30
-      storage_class = "STANDARD_IA"
-    }
-    
-    transition {
-      days          = 90
-      storage_class = "GLACIER"
-    }
-    
-    expiration {
-      days = 365
-    }
-
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 7
-    }
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "lb_logs" {
-  bucket = aws_s3_bucket.lb_logs.id
-  
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# Adding S3 bucket server-side encryption for lb_logs
-resource "aws_s3_bucket_server_side_encryption_configuration" "lb_logs" {
-  bucket = aws_s3_bucket.lb_logs.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      kms_master_key_id = aws_kms_key.encryption_key.arn
-      sse_algorithm     = "aws:kms"
-    }
-  }
-}
-
-resource "aws_s3_bucket_notification" "lb_logs" {
-  bucket = aws_s3_bucket.lb_logs.id
-  
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.log_processor.arn
-    events              = ["s3:ObjectCreated:*"]
-  }
-}
-
-resource "aws_s3_bucket_replication_configuration" "lb_logs" {
-  bucket = aws_s3_bucket.lb_logs.id
-  role   = aws_iam_role.replication.arn
-  
-  rule {
-    id     = "logs_replication"
-    status = "Enabled"
-    
-    destination {
-      bucket        = aws_s3_bucket.lb_logs_replica.arn
-      storage_class = "STANDARD_IA"
-    }
-  }
-}
-
-resource "aws_s3_bucket" "lb_logs_replica" {
-  provider = aws.replica_region
-  bucket   = "demo-lb-logs-replica-${data.aws_caller_identity.current.account_id}"
-}
-
 resource "aws_s3_bucket_server_side_encryption_configuration" "log_bucket" {
   bucket = aws_s3_bucket.log_bucket.id
-  
+
   rule {
     apply_server_side_encryption_by_default {
       kms_master_key_id = aws_kms_key.encryption_key.arn
@@ -369,21 +357,25 @@ resource "aws_s3_bucket_versioning" "log_bucket" {
 
 resource "aws_s3_bucket_lifecycle_configuration" "log_bucket" {
   bucket = aws_s3_bucket.log_bucket.id
-  
+
   rule {
     id     = "log_bucket_lifecycle"
     status = "Enabled"
-    
+
+    filter {
+      prefix = "logs/"
+    }
+
     transition {
       days          = 30
       storage_class = "STANDARD_IA"
     }
-    
+
     transition {
       days          = 90
       storage_class = "GLACIER"
     }
-    
+
     expiration {
       days = 365
     }
@@ -396,7 +388,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "log_bucket" {
 
 resource "aws_s3_bucket_public_access_block" "log_bucket" {
   bucket = aws_s3_bucket.log_bucket.id
-  
+
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
@@ -415,11 +407,11 @@ resource "aws_s3_bucket_notification" "log_bucket" {
 resource "aws_s3_bucket_replication_configuration" "log_bucket" {
   bucket = aws_s3_bucket.log_bucket.id
   role   = aws_iam_role.replication.arn
-  
+
   rule {
     id     = "log_bucket_replication"
     status = "Enabled"
-    
+
     destination {
       bucket        = aws_s3_bucket.log_bucket_replica.arn
       storage_class = "STANDARD_IA"
@@ -434,8 +426,8 @@ resource "aws_s3_bucket" "log_bucket_replica" {
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "lb_logs_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.lb_logs_replica.id
-  
+  bucket   = aws_s3_bucket.lb_logs_replica.id
+
   rule {
     apply_server_side_encryption_by_default {
       kms_master_key_id = aws_kms_key.encryption_key.arn
@@ -446,7 +438,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "lb_logs_replica" 
 
 resource "aws_s3_bucket_versioning" "lb_logs_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.lb_logs_replica.id
+  bucket   = aws_s3_bucket.lb_logs_replica.id
   versioning_configuration {
     status = "Enabled"
   }
@@ -454,22 +446,26 @@ resource "aws_s3_bucket_versioning" "lb_logs_replica" {
 
 resource "aws_s3_bucket_lifecycle_configuration" "lb_logs_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.lb_logs_replica.id
-  
+  bucket   = aws_s3_bucket.lb_logs_replica.id
+
   rule {
     id     = "replica_lifecycle"
     status = "Enabled"
-    
+
+    filter {
+      prefix = "replica/"
+    }
+
     transition {
       days          = 30
       storage_class = "STANDARD_IA"
     }
-    
+
     transition {
       days          = 90
       storage_class = "GLACIER"
     }
-    
+
     expiration {
       days = 365
     }
@@ -482,8 +478,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "lb_logs_replica" {
 
 resource "aws_s3_bucket_public_access_block" "lb_logs_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.lb_logs_replica.id
-  
+  bucket   = aws_s3_bucket.lb_logs_replica.id
+
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
@@ -492,15 +488,15 @@ resource "aws_s3_bucket_public_access_block" "lb_logs_replica" {
 
 resource "aws_s3_bucket_logging" "lb_logs_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.lb_logs_replica.id
-  
+  bucket   = aws_s3_bucket.lb_logs_replica.id
+
   target_bucket = aws_s3_bucket.log_bucket.id
   target_prefix = "replica-log/"
 }
 
 resource "aws_s3_bucket_notification" "lb_logs_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.lb_logs_replica.id
+  bucket   = aws_s3_bucket.lb_logs_replica.id
 
   lambda_function {
     lambda_function_arn = aws_lambda_function.log_processor.arn
@@ -508,9 +504,14 @@ resource "aws_s3_bucket_notification" "lb_logs_replica" {
   }
 }
 
+resource "aws_s3_bucket" "lb_logs_replica" {
+  provider = aws.replica_region
+  bucket   = "demo-lb-logs-replica-${data.aws_caller_identity.current.account_id}"
+}
+
 resource "aws_s3_bucket_server_side_encryption_configuration" "log_bucket_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.log_bucket_replica.id
+  bucket   = aws_s3_bucket.log_bucket_replica.id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -522,7 +523,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "log_bucket_replic
 
 resource "aws_s3_bucket_versioning" "log_bucket_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.log_bucket_replica.id
+  bucket   = aws_s3_bucket.log_bucket_replica.id
   versioning_configuration {
     status = "Enabled"
   }
@@ -530,11 +531,15 @@ resource "aws_s3_bucket_versioning" "log_bucket_replica" {
 
 resource "aws_s3_bucket_lifecycle_configuration" "log_bucket_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.log_bucket_replica.id
+  bucket   = aws_s3_bucket.log_bucket_replica.id
 
   rule {
     id     = "replica_lifecycle"
     status = "Enabled"
+
+    filter {
+      prefix = "replica-logs/"
+    }
 
     transition {
       days          = 30
@@ -558,7 +563,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "log_bucket_replica" {
 
 resource "aws_s3_bucket_public_access_block" "log_bucket_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.log_bucket_replica.id
+  bucket   = aws_s3_bucket.log_bucket_replica.id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -568,7 +573,7 @@ resource "aws_s3_bucket_public_access_block" "log_bucket_replica" {
 
 resource "aws_s3_bucket_logging" "log_bucket_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.log_bucket_replica.id
+  bucket   = aws_s3_bucket.log_bucket_replica.id
 
   target_bucket = aws_s3_bucket.log_bucket.id
   target_prefix = "replica-logs/"
@@ -576,12 +581,75 @@ resource "aws_s3_bucket_logging" "log_bucket_replica" {
 
 resource "aws_s3_bucket_notification" "log_bucket_replica" {
   provider = aws.replica_region
-  bucket = aws_s3_bucket.log_bucket_replica.id
+  bucket   = aws_s3_bucket.log_bucket_replica.id
 
   lambda_function {
     lambda_function_arn = aws_lambda_function.log_processor.arn
     events              = ["s3:ObjectCreated:*"]
   }
+}
+
+resource "aws_iam_role" "replication" {
+  name = "s3-bucket-replication"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "s3.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "replication" {
+  name = "s3-bucket-replication-policy"
+  role = aws_iam_role.replication.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "s3:GetReplicationConfiguration",
+          "s3:ListBucket"
+        ]
+        Effect = "Allow"
+        Resource = [
+          aws_s3_bucket.lb_logs.arn,
+          aws_s3_bucket.log_bucket.arn
+        ]
+      },
+      {
+        Action = [
+          "s3:GetObjectVersionForReplication",
+          "s3:GetObjectVersionAcl",
+          "s3:GetObjectVersionTagging"
+        ]
+        Effect = "Allow"
+        Resource = [
+          "${aws_s3_bucket.lb_logs.arn}/*",
+          "${aws_s3_bucket.log_bucket.arn}/*"
+        ]
+      },
+      {
+        Action = [
+          "s3:ReplicateObject",
+          "s3:ReplicateDelete",
+          "s3:ReplicateTags"
+        ]
+        Effect = "Allow"
+        Resource = [
+          "${aws_s3_bucket.lb_logs_replica.arn}/*",
+          "${aws_s3_bucket.log_bucket_replica.arn}/*"
+        ]
+      }
+    ]
+  })
 }
 
 resource "aws_lb_listener" "front_end" {
@@ -595,6 +663,24 @@ resource "aws_lb_listener" "front_end" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.lambda.arn
   }
+}
+
+resource "aws_lb_target_group" "lambda" {
+  name        = "lambda-target-group"
+  target_type = "lambda"
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 3
+    interval            = 30
+    timeout             = 5
+    unhealthy_threshold = 3
+  }
+}
+
+resource "aws_lb_target_group_attachment" "lambda" {
+  target_group_arn = aws_lb_target_group.lambda.arn
+  target_id        = aws_lambda_function.hello_world.arn
 }
 
 resource "aws_wafv2_web_acl" "main" {
@@ -623,66 +709,66 @@ resource "aws_wafv2_web_acl" "main" {
 
     visibility_config {
       cloudwatch_metrics_enabled = true
-      metric_name               = "AWSManagedRulesCommonRuleSetMetric"
-      sampled_requests_enabled  = true
+      metric_name                = "AWSManagedRulesCommonRuleSetMetric"
+      sampled_requests_enabled   = true
     }
   }
-  
+
   rule {
     name     = "AWSManagedRulesKnownBadInputsRuleSet"
     priority = 2
-    
+
     override_action {
       none {}
     }
-    
+
     statement {
       managed_rule_group_statement {
         name        = "AWSManagedRulesKnownBadInputsRuleSet"
         vendor_name = "AWS"
       }
     }
-    
+
     visibility_config {
       cloudwatch_metrics_enabled = true
-      metric_name               = "KnownBadInputsRuleSetMetric"
-      sampled_requests_enabled  = true
+      metric_name                = "KnownBadInputsRuleSetMetric"
+      sampled_requests_enabled   = true
     }
   }
-  
+
   rule {
     name     = "Log4JRCE"
     priority = 3
-    
+
     override_action {
       none {}
     }
-    
+
     statement {
       managed_rule_group_statement {
         name        = "AWSManagedRulesKnownBadInputsRuleSet"
         vendor_name = "AWS"
-        
+
         rule_action_override {
-          name         = "Log4JRCE"
+          name = "Log4JRCE"
           action_to_use {
             block {}
           }
         }
       }
     }
-    
+
     visibility_config {
       cloudwatch_metrics_enabled = true
-      metric_name               = "Log4JRCEMetric"
-      sampled_requests_enabled  = true
+      metric_name                = "Log4JRCEMetric"
+      sampled_requests_enabled   = true
     }
   }
 
   visibility_config {
     cloudwatch_metrics_enabled = true
-    metric_name               = "demo-waf"
-    sampled_requests_enabled  = true
+    metric_name                = "demo-waf"
+    sampled_requests_enabled   = true
   }
 }
 
@@ -693,31 +779,105 @@ resource "aws_wafv2_web_acl_association" "main" {
 
 resource "aws_wafv2_web_acl_logging_configuration" "main" {
   log_destination_configs = [aws_kinesis_firehose_delivery_stream.waf_logs.arn]
-  resource_arn           = aws_wafv2_web_acl.main.arn
+  resource_arn            = aws_wafv2_web_acl.main.arn
+}
+
+resource "aws_s3_bucket" "waf_logs" {
+  bucket = "demo-waf-logs-${data.aws_caller_identity.current.account_id}"
+}
+
+resource "aws_s3_bucket_versioning" "waf_logs" {
+  bucket = aws_s3_bucket.waf_logs.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "waf_logs" {
+  bucket = aws_s3_bucket.waf_logs.id
+  rule {
+    apply_server_side_encryption_by_default {
+      kms_master_key_id = aws_kms_key.encryption_key.arn
+      sse_algorithm     = "aws:kms"
+    }
+  }
 }
 
 resource "aws_kinesis_firehose_delivery_stream" "waf_logs" {
   name        = "aws-waf-logs"
-  destination = "s3"
-  
+  destination = "extended_s3"
+
   server_side_encryption {
     enabled  = true
     key_type = "CUSTOMER_MANAGED_CMK"
     key_arn  = aws_kms_key.encryption_key.arn
   }
-  
-  s3_configuration {
+
+  extended_s3_configuration {
     role_arn   = aws_iam_role.firehose.arn
     bucket_arn = aws_s3_bucket.waf_logs.arn
-    
-    buffering_size = 5
+
+    buffering_size     = 5
     buffering_interval = 300
     compression_format = "GZIP"
-    
-    encryption_configuration {
-      kms_key_arn = aws_kms_key.encryption_key.arn
-    }
+
+    kms_key_arn = aws_kms_key.encryption_key.arn
   }
 }
 
+resource "aws_iam_role" "firehose" {
+  name = "waf-logs-firehose"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "firehose.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "firehose" {
+  name = "waf-logs-firehose-policy"
+  role = aws_iam_role.firehose.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:AbortMultipartUpload",
+          "s3:GetBucketLocation",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads",
+          "s3:PutObject"
+        ]
+        Resource = [
+          aws_s3_bucket.waf_logs.arn,
+          "${aws_s3_bucket.waf_logs.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey"
+        ]
+        Resource = [
+          aws_kms_key.encryption_key.arn
+        ]
+      }
+    ]
+  })
+}
+
 data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
