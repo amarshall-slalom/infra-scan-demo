@@ -27,3 +27,16 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: docker/Dockerfile
+  
+  tffmt:
+    name: Terraform Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run Terraform Format
+        run: |
+          terraform fmt -check=true -diff=true -write=false -list=false -recursive infrastructure/
+          if [ $? -ne 0 ]; then
+            echo "Terraform format check failed."
+            exit 1
+          fi
