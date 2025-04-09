@@ -60,6 +60,19 @@ resource "aws_lb" "front_end" {
   subnets = ["subnet-12345678", "subnet-87654321"] # Example subnet IDs
 }
 
+resource "aws_lb_target_group" "lambda" {
+  name        = "demo-lambda-tg"
+  target_type = "lambda"
+  port        = 80
+  protocol    = "HTTP"  # Intentionally using HTTP for demo
+  vpc_id      = "vpc-12345678"  # Example VPC ID
+}
+
+resource "aws_lb_target_group_attachment" "lambda" {
+  target_group_arn = aws_lb_target_group.lambda.arn
+  target_id        = aws_lambda_function.hello_world.arn
+}
+
 resource "aws_lb_listener" "front_end" {
   load_balancer_arn = aws_lb.front_end.arn
   port              = "80" # Intentionally using HTTP
