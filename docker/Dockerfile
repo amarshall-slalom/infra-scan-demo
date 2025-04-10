@@ -1,10 +1,21 @@
-FROM python:3.9
-MAINTAINER demo@example.com
+FROM python:3.9-slim
 
-RUN apt-get update
-RUN apt-get install -y curl
+LABEL maintainer="demo@example.com"
 
-COPY ../src/lambda_function.py .
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl=7.74.0-* && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-USER root
+WORKDIR /app
+COPY src/lambda_function.py .
+
+RUN useradd -r -s /bin/false appuser && \
+    chown appuser:appuser /app
+
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
 CMD ["python", "lambda_function.py"]
