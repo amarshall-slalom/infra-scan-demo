@@ -1,0 +1,9 @@
+# Intentionally ignoring rules for demo purposes
+ignored:
+  - DL4000  # MAINTAINER is deprecated
+  - DL3059  # Multiple consecutive RUN instructions
+  - DL3009  # Delete apt-get lists after installing
+  - DL3015  # Avoid additional packages by specifying --no-install-recommends
+  - DL3008  # Pin versions in apt get install
+  - DL3045  # COPY to not specified WORKDIR
+  - DL3002  # Last USER should not be root
