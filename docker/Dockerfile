@@ -1,3 +1,6 @@
+# checkov:skip=CKV_DOCKER_6: Intentionally using deprecated MAINTAINER for demo
+# checkov:skip=CKV_DOCKER_8: Intentionally using root user for demo
+# checkov:skip=CKV_DOCKER_2: Intentionally omitting HEALTHCHECK for demo
 FROM python:3.9
 MAINTAINER demo@example.com
 
