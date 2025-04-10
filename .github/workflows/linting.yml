@@ -6,8 +6,12 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
 jobs:
-# checkov:skip=CKV2_GHA_1: Intentionally skipping permission check
   checkov:
     name: Checkov
     runs-on: ubuntu-latest
